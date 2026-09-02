@@ -1,23 +1,11 @@
 defmodule RobotSimulator do
   @directions [:north, :east, :south, :west]
 
-  @doc """
-  Create a Robot Simulator given an initial direction and position.
-
-  Valid directions are: :north, :east, :south, :west
-  """
-  @spec create(direction :: atom, position :: {integer, integer}) :: any
   def create(direction, {x, y} = position)
       when direction in @directions and is_integer(x) and is_integer(y) do
     {direction, position}
   end
 
-  @doc """
-  Simulate the robot's movement given a string of instructions.
-
-  Valid instructions are: "R" (turn right), "L", (turn left), and "A" (advance)
-  """
-  @spec simulate(robot :: any, instructions :: String.t()) :: any
   def simulate(robot, instructions) when is_binary(instructions) do
     instructions
     |> String.graphemes()
@@ -43,17 +31,7 @@ defmodule RobotSimulator do
   defp advance(:east, {x, y}), do: {x + 1, y}
   defp advance(:west, {x, y}), do: {x - 1, y}
 
-  @doc """
-  Return the robot's direction.
-
-  Valid directions are: :north, :east, :south, :west
-  """
-  @spec direction(robot :: any) :: atom
   def direction({direction, _position}), do: direction
 
-  @doc """
-  Return the robot's position.
-  """
-  @spec position(robot :: any) :: {integer, integer}
   def position({_direction, position}), do: position
 end

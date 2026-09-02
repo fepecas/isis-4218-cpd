@@ -1,12 +1,6 @@
 defmodule WordCount do
   @word_pattern ~r/[a-z]+'[a-z]+|[a-z]+|\d+/
 
-  @doc """
-  Count the number of words in the sentence.
-
-  Words are compared case-insensitively.
-  """
-  @spec count(String.t()) :: map
   def count(sentence) do
     sentence
     |> String.downcase()

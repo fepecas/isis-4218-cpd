@@ -1,0 +1,9 @@
+_build/
+deps/
+.elixir_ls/
+*.ez
+erl_crash.dump
+.DS_Store
+
+# Course content
+content/

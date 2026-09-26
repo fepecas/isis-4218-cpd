@@ -27,12 +27,14 @@ defmodule Gate.Venue do
     Sync.stop(venue)
   end
 
+  # A failed operation still hands back the sector with the expiries it decided, so an
+  # answer like `:expired` is committed together with the state it was based on.
   @impl Gate.API
   def reserve(venue, sector, qty, mode) do
     Sync.update(venue, sector, fn state, now ->
       case Sector.reserve(state, qty, mode, now) do
         {:ok, state, hold_id, seat_ids} -> {{:ok, hold_id, seat_ids}, state}
-        {:error, reason} -> {{:error, reason}, state}
+        {:error, reason} -> {{:error, reason}, Sector.sweep(state, now)}
       end
     end)
   end
@@ -43,7 +45,7 @@ defmodule Gate.Venue do
       case Sync.update(venue, sector, fn state, now ->
              case Sector.confirm(state, hold_id, now) do
                {:ok, state, tickets} -> {{:ok, tickets}, state}
-               {:error, reason} -> {{:error, reason}, state}
+               {:error, reason} -> {{:error, reason}, Sector.sweep(state, now)}
              end
            end) do
         {:error, :bad_sector} -> {:error, :unknown_hold}
@@ -60,7 +62,7 @@ defmodule Gate.Venue do
       case Sync.update(venue, sector, fn state, now ->
              case Sector.cancel(state, hold_id, now) do
                {:ok, state} -> {:ok, state}
-               {:error, reason} -> {{:error, reason}, state}
+               {:error, reason} -> {{:error, reason}, Sector.sweep(state, now)}
              end
            end) do
         {:error, :bad_sector} -> {:error, :unknown_hold}

@@ -22,30 +22,48 @@ defmodule Gate.Sync do
   out the answer, and writing the sector back cannot be three steps that another client
   can slip between. How you arrange that is the assignment.
 
-  ## This assignment: threads and a mutex
+  ## This assignment: software transactional memory
 
-  There is no shared mutable memory on the BEAM once `Agent`, `GenServer` and `:ets` are
-  off the table, so the only place a sector's state can live is inside one process's own
-  loop variable. That process is spawned once per sector, in `start/1`, and never touches
-  any other sector.
+  Each sector's state lives in one transactional variable, a TVar: a process whose only
+  loop variables are the current value and a version number that goes up by one on every
+  successful write. A TVar never runs a transition. It answers two requests and nothing
+  else:
 
-  A caller of `update/3` never reads or writes that state directly. It sends the pure
-  transition to the owning process and blocks in `receive` for the single reply. The
-  owning process serves its mailbox one message at a time, which is exactly the property
-  a mutex gives you around a critical section: whichever request arrives first gets the
-  state, runs `fun` to completion, publishes the new state as its own next loop argument,
-  and only then looks at the next message. Two concurrent callers on the same sector are
-  serialized by the mailbox; callers on different sectors never wait on each other,
-  because they talk to different processes.
+    * `read`, which returns the current `{version, value}` pair, and
+    * `commit(expected_version, new_value)`, which installs `new_value` only if the
+      version is still `expected_version`, and otherwise answers `:conflict`. The version
+      is checked before the value is sent, the way a TL2 commit takes a versioned write
+      lock, so a commit that is going to lose never ships the sector at all.
 
-  There is exactly one round trip per `update/3` call (one `send`, one `receive`), so
-  there is nothing to forget to release and nothing to hold across a `receive`: the
-  section that would need a mutex in a threaded language is entirely inside the owning
-  process, which cannot be preempted mid-step by another message.
+  `update/3` is the transaction, and it runs in the caller's own process. It reads the
+  TVar, takes the time, runs `fun` on its private copy of the value, and tries to commit.
+  If nobody else committed to that sector in between, the commit succeeds and the result
+  is returned. If somebody did, the value `fun` saw is stale, so the attempt is thrown
+  away whole and the transaction starts again from a fresh read. This is optimistic
+  concurrency: nobody holds anything while `fun` runs, many clients can be computing
+  against the same sector at the same time, and the only thing serialized is the commit:
+  the version check plus the hand over of the new value, never the transition itself.
+
+  Re-running is safe because `fun` is a pure function of `(value, now)`: an attempt that
+  loses the race has touched nothing but its own copy, so throwing it away leaves no
+  trace. A result is only ever returned from an attempt that committed, which is what
+  keeps a hold id, a ticket or a `:sold_out` from being handed out on a stale view. A
+  transition that changes nothing (a failed reserve, `availability`, a `snapshot` with
+  nothing to expire) is a read-only transaction and skips the commit: one read of one
+  TVar is already a consistent view of that sector at the moment it was taken.
+
+  Conflicts are per sector, because each sector is its own TVar: a transaction on one
+  sector never reads, validates against, or waits for another. The retry is not the
+  caller waiting for anyone, it is the transaction re-executing against newer data, so
+  `reserve/4` still never queues behind a cancel and still fails at once when the
+  committed state says it must.
   """
 
-  @typedoc "One sector name mapped to the pid of the process that owns its state."
+  @typedoc "One sector name mapped to the pid of the TVar that holds its state."
   @type venue :: %{Gate.API.sector() => pid}
+
+  @typedoc "A pure transition of one sector, given the current time in milliseconds."
+  @type transition(result) :: (Gate.Sector.t(), integer -> {result, Gate.Sector.t()})
 
   @doc "Set up whatever owns the state, and return the handle for it."
   @spec start(Gate.API.venue_spec()) :: {:ok, venue} | {:error, term}
@@ -53,7 +71,7 @@ defmodule Gate.Sync do
     sectors =
       for {name, shape} <- spec.sectors, into: %{} do
         sector = Gate.Sector.new(name, shape, spec.ttl_ms)
-        {name, spawn(fn -> loop(sector) end)}
+        {name, spawn(fn -> tvar(0, sector) end)}
       end
 
     {:ok, sectors}
@@ -62,7 +80,7 @@ defmodule Gate.Sync do
   @doc "Take it all down. Calling this twice must still work."
   @spec stop(venue) :: :ok
   def stop(venue) do
-    Enum.each(venue, fn {_name, pid} -> send(pid, :stop) end)
+    Enum.each(venue, fn {_name, tvar} -> send(tvar, :stop) end)
     :ok
   end
 
@@ -75,40 +93,110 @@ defmodule Gate.Sync do
 
   See the module documentation. This function is the whole assignment.
   """
-  @spec update(venue, Gate.API.sector(), (Gate.Sector.t(), integer -> {result, Gate.Sector.t()})) ::
-          result | {:error, :bad_sector}
+  @spec update(venue, Gate.API.sector(), transition(result)) :: result | {:error, :bad_sector}
         when result: term
   def update(venue, sector, fun) do
     case Map.fetch(venue, sector) do
-      {:ok, pid} ->
-        ref = make_ref()
-        send(pid, {:update, fun, ref, self()})
-
-        receive do
-          {:reply, ^ref, result} -> result
-        end
+      {:ok, tvar} ->
+        # The monitor ref doubles as the tag of every request this transaction sends, and
+        # turns a stopped venue into an error instead of a caller blocked forever.
+        tag = Process.monitor(tvar)
+        result = atomically(tvar, tag, fun)
+        Process.demonitor(tag, [:flush])
+        result
 
       :error ->
         {:error, :bad_sector}
     end
   end
 
-  defp loop(state) do
-    receive do
-      {:update, fun, ref, from} ->
-        now = System.monotonic_time(:millisecond)
+  # One transaction: read, compute on a private copy, validate and commit, or start over.
+  defp atomically(tvar, tag, fun) do
+    with {:ok, version, state} <- read(tvar, tag) do
+      now = System.monotonic_time(:millisecond)
 
-        try do
-          {result, new_state} = fun.(state, now)
-          send(from, {:reply, ref, result})
-          loop(new_state)
-        rescue
-          # A transition must never take the whole sector down with it: without this,
-          # one bad `fun` would crash the owning process and hang every caller forever.
-          _ ->
-            send(from, {:reply, ref, {:error, :internal_error}})
-            loop(state)
+      case run(fun, state, now) do
+        {:ok, result, ^state} ->
+          result
+
+        {:ok, result, new_state} ->
+          case commit(tvar, tag, version, new_state) do
+            :ok -> result
+            :conflict -> atomically(tvar, tag, fun)
+            {:error, reason} -> {:error, reason}
+          end
+
+        :error ->
+          {:error, :internal_error}
+      end
+    end
+  end
+
+  # A transition must never take anything down with it. Nothing has been written yet, so
+  # the sector stays exactly as it was and the caller gets an error instead of a crash.
+  defp run(fun, state, now) do
+    {result, new_state} = fun.(state, now)
+    {:ok, result, new_state}
+  rescue
+    _ -> :error
+  end
+
+  defp read(tvar, tag) do
+    send(tvar, {:read, self(), tag})
+
+    receive do
+      {^tag, version, state} -> {:ok, version, state}
+      {:DOWN, ^tag, :process, _pid, _reason} -> {:error, :bad_sector}
+    end
+  end
+
+  # Validate first with a message that carries only the version, and ship the new value
+  # only once the TVar has granted the write. A sector is tens to hundreds of kilobytes,
+  # so sending it with every attempt would flood the TVar with values that are about to be
+  # rejected anyway; this way a losing attempt costs two small messages.
+  defp commit(tvar, tag, version, state) do
+    send(tvar, {:lock, self(), tag, version})
+
+    receive do
+      {^tag, :locked, lock} ->
+        send(tvar, {lock, state})
+        :ok
+
+      {^tag, :conflict} ->
+        :conflict
+
+      {:DOWN, ^tag, :process, _pid, _reason} ->
+        {:error, :bad_sector}
+    end
+  end
+
+  # The TVar. It holds the committed value and its version, and user code never runs in
+  # here. A lock is granted only to a transaction whose read version is still current, and
+  # it lasts exactly until that transaction's value arrives, so readers never see anything
+  # but whole committed values. If the writer dies in between, the monitor gives the lock
+  # back and the old value stays.
+  defp tvar(version, state) do
+    receive do
+      {:read, from, tag} ->
+        send(from, {tag, version, state})
+        tvar(version, state)
+
+      {:lock, from, tag, ^version} ->
+        lock = Process.monitor(from)
+        send(from, {tag, :locked, lock})
+
+        receive do
+          {^lock, new_state} ->
+            Process.demonitor(lock, [:flush])
+            tvar(version + 1, new_state)
+
+          {:DOWN, ^lock, :process, _pid, _reason} ->
+            tvar(version, state)
         end
+
+      {:lock, from, tag, _stale} ->
+        send(from, {tag, :conflict})
+        tvar(version, state)
 
       :stop ->
         :ok

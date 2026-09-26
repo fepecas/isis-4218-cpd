@@ -216,9 +216,14 @@ defmodule Gate.Sector do
     {sector, snapshot}
   end
 
-  # Drop every pending hold whose ttl has passed, freeing its seats back to the rows.
-  # Runs first inside every operation so expiry can never be observed as a stale read.
-  defp sweep(sector, now) do
+  @doc """
+  Drop every pending hold whose ttl has passed, freeing its seats back to the rows.
+
+  Runs first inside every operation so expiry can never be observed as a stale read.
+  Public so that a caller whose operation failed can still keep the expiries it saw.
+  """
+  @spec sweep(t, integer) :: t
+  def sweep(sector, now) do
     Enum.reduce(sector.pending, sector, fn hold_id, sector ->
       hold = Map.fetch!(sector.holds, hold_id)
 
